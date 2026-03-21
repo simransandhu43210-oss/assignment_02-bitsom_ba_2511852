@@ -1,0 +1,23 @@
+## Part 6.2 — Design Justification
+
+*Storage Systems*
+
+Each storage system in the architecture was chosen to match the access pattern and latency requirements of its corresponding goal.
+
+Goal 1 — Patient Readmission Risk Prediction uses Amazon RDS (PostgreSQL) for live patient records, chosen for ACID guarantees and relational integrity when reading structured clinical data at inference time. Amazon Redshift stores historical data for periodic model retraining, as its columnar MPP architecture handles the large-scale aggregations that XGBoost feature engineering demands.
+
+Goal 2 — Natural Language Query uses Amazon OpenSearch to store vector embeddings of clinical documents. OpenSearch natively supports approximate nearest-neighbour search via k-NN indexing, enabling the Bedrock RAG pipeline to retrieve semantically relevant passages — something a traditional relational store with LIKE queries cannot do across millions of text chunks.
+
+Goal 3 — BI Reporting uses Amazon Redshift as the central OLAP warehouse, fed by AWS Glue ETL from all batch sources. Amazon S3 acts as the raw data lake, archiving every ingested record before transformation to provide a replayable source of truth and low-cost long-term retention.
+
+Goal 4 — Real-time ICU Vitals Monitoring uses Amazon Timestream, a purpose-built time-series database that handles high-frequency MQTT telemetry with millisecond ingestion latency and built-in time-series functions — far better suited to this workload than a general-purpose relational database. CloudWatch and SNS sit on top for alerting.
+
+*OLTP vs OLAP Boundary*
+
+The OLTP boundary is defined by Amazon RDS (PostgreSQL), which handles all transactional writes — patient admissions, lab updates, and live record changes requiring row-level consistency and immediate durability. The OLAP boundary begins at Amazon Redshift, which only receives data after it has been extracted, cleaned, and transformed by AWS Glue ETL jobs. Glue is the explicit demarcation point: it reads from RDS, the Lab/Pharmacy systems, and the Hospital ERP, then loads into Redshift on a batch schedule. No application writes directly to Redshift. Amazon S3 sits alongside this boundary as a staging and archival layer, capturing raw data from all sources before it is structured into the warehouse schema.
+
+*Trade-offs*
+
+The most significant trade-off in this design is the batch ETL latency introduced by AWS Glue between operational sources and Redshift. Because Glue runs on a schedule (hourly or nightly), the BI dashboards and the readmission model's training data will always reflect a slightly stale view of reality — a patient discharged an hour ago may not yet appear in QuickSight reports. This is acceptable for monthly management reporting but could matter for time-sensitive operational decisions.
+
+The mitigation strategy is twofold. First, for Goal 1, the SageMaker model reads live feature data directly from RDS at inference time, bypassing the ETL lag entirely — so risk scores are always computed on current records even if Redshift is behind. Second, for near-real-time reporting needs, the real-time pipeline (IoT Core → Kinesis → Timestream) already operates outside the batch boundary and feeds CloudWatch independently. If sub-hour BI freshness becomes a requirement in future, AWS Glue can be supplemented with Amazon Kinesis Data Firehose to stream change events from RDS into Redshift incrementally, reducing the lag to under five minutes without a full architectural redesign.
